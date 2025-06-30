@@ -1006,6 +1006,13 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 # y2_flag=False, # old api; 第三个输出是否输出
                 routed_scaling_factor=1,
                 eps=float(1e-20))
+        elif global_num_experts == 128 and scoring_func == "softmax":
+            topk_weights, topk_ids, _ = torch_npu.npu_moe_gating_top_k_softmax(
+                x=router_logits,
+                finished=None,
+                k=top_k)
+            if renormalize:
+                topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
         else:
             topk_weights, topk_ids = select_experts(
                 hidden_states=x,
