@@ -21,9 +21,7 @@ import torch
 from vllm.model_executor.layers.fused_moe.layer import \
     UnquantizedFusedMoEMethod
 
-from vllm_ascend.ops.fused_moe import (fused_experts, fused_experts_moge,
-                                       select_experts)
-from vllm_ascend.utils import is_310p
+from vllm_ascend.ops.fused_moe import fused_experts, select_experts
 
 
 def forward_oot(
@@ -45,7 +43,6 @@ def forward_oot(
     activation: str = "silu",
 ) -> torch.Tensor:
     topk_weights, topk_ids = select_experts(
-        global_num_experts=global_num_experts,
         hidden_states=x,
         router_logits=router_logits,
         top_k=top_k,
@@ -57,19 +54,6 @@ def forward_oot(
         scoring_func=scoring_func,
         e_score_correction_bias=e_score_correction_bias,
     )
-
-    if topk_ids.shape[1] < top_k or is_310p():
-        assert global_num_experts is not None
-        return fused_experts_moge(
-            hidden_states=x,
-            w1=layer.w13_weight,
-            w2=layer.w2_weight,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            top_k=top_k,
-            global_num_experts=global_num_experts,
-            expert_map=expert_map,
-            apply_router_weight_on_input=apply_router_weight_on_input)
 
     return fused_experts(
         hidden_states=x,

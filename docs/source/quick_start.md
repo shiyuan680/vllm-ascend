@@ -32,8 +32,6 @@ docker run --rm \
 -v /root/.cache:/root/.cache \
 -p 8000:8000 \
 -it $IMAGE bash
-# Install curl
-apt-get update -y && apt-get install -y curl
 ```
 ::::
 
@@ -60,8 +58,6 @@ docker run --rm \
 -v /root/.cache:/root/.cache \
 -p 8000:8000 \
 -it $IMAGE bash
-# Install curl
-yum update -y && yum install -y curl
 ```
 ::::
 :::::
