@@ -30,6 +30,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu_input_batch import InputBatch
 
 from vllm_ascend.ops.attention import vanilla_chunked_prefill
+from vllm_ascend.multistream.base import MSAttentionMetadataSplitConfig
 
 
 class AscendAttentionBackend(AttentionBackend):
@@ -137,6 +138,19 @@ class AscendMetadata:
     num_input_tokens: int = 0  # Number of tokens including padding.
 
     with_prefill_across_dp: bool = False
+    enable_dbo_across_dp: bool = False
+
+    def split_metadata_for_multistream(
+            self,
+            ms_split_config: MSAttentionMetadataSplitConfig,
+    ) -> list["AscendMetadata"]:
+        """Split metadata for multi-stream with AscendMetadata"""
+        from vllm_ascend.multistream.ms_split import model_input_split_v1_attn
+        return model_input_split_v1_attn(
+            ms_split_config=ms_split_config,
+            attn_metadata=self,
+            _metadata_cls=AscendMetadata,
+        )
 
 
 class AscendAttentionMetadataBuilder:
@@ -154,7 +168,8 @@ class AscendAttentionMetadataBuilder:
               max_query_len,
               common_prefix_len,
               max_num_tokens_across_dp: int = 0,
-              with_prefill_across_dp: bool = False):
+              with_prefill_across_dp: bool = False,
+              enable_dbo_across_dp: bool = False):
 
         block_table = self.runner.input_batch.block_table[0].get_device_tensor(
         )
@@ -182,7 +197,9 @@ class AscendAttentionMetadataBuilder:
             attn_mask=attn_mask,
             attn_state=attn_state,
             max_num_tokens_across_dp=max_num_tokens_across_dp,
-            with_prefill_across_dp=with_prefill_across_dp)
+            with_prefill_across_dp=with_prefill_across_dp,
+            enable_dbo_across_dp=enable_dbo_across_dp
+        )
         return attn_metadata
 
 
