@@ -46,6 +46,7 @@ from vllm_ascend.utils import (FusedMoEState, dispose_tensor,
 
 MOE_ALL2ALL_BUFFER: bool = envs_ascend.MOE_ALL2ALL_BUFFER
 ENABLE_MOE_ALLTOALLV: bool = envs_ascend.ENABLE_MOE_ALLTOALLV
+VLLM_ASCEND_ENABLE_DBO: bool = envs_ascend.VLLM_ASCEND_ENABLE_DBO
 
 
 def process_topk_ids(topk_ids: torch.Tensor, expert_num: int, ep_size: int,
@@ -1169,6 +1170,8 @@ class AscendFusedMoE(FusedMoE):
                                      .set_scaling_factor(1.0)
                                      .build())
             self.token_dispatcher = MoEAlltoAllSeqOverLapDispatcher(moe_dispatcher_config)
+            if VLLM_ASCEND_ENABLE_DBO:
+                self.token_dispatchers = [self.token_dispatcher, MoEAlltoAllSeqOverLapDispatcher(moe_dispatcher_config)]
 
     def forward(self,
                 hidden_states: torch.Tensor,
