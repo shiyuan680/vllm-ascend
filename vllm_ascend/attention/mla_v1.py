@@ -12,7 +12,12 @@ from vllm.config import get_current_vllm_config
 from vllm.model_executor.layers.linear import (LinearBase,
                                                UnquantizedLinearMethod)
 from vllm.utils import cdiv, round_down
-
+from vllm.distributed import (get_pp_group,
+                              get_tensor_model_parallel_world_size,
+                              get_tp_group, split_tensor_along_last_dim,
+                              tensor_model_parallel_all_gather,
+                              tensor_model_parallel_all_reduce,
+                              tensor_model_parallel_reduce_scatter)
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention import _ALLOWED_NUM_QUERIES_PER_KV
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
@@ -570,6 +575,9 @@ class AscendMLAImpl(MLAAttentionImpl):
             self.spec_token_num = speculative_config.num_speculative_tokens
             assert self.spec_token_num > 0
 
+        self.sp_size = get_tensor_model_parallel_world_size()
+        self.sp_group = get_tp_group().device_group
+
         # TODO: support numHeads / numKvHeads < 16 in MLA kernel
         if self.torchair_graph_enabled:
             assert self.num_queries_per_kv in _ALLOWED_NUM_QUERIES_PER_KV, \
@@ -845,12 +853,18 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         current_ms_metadata = get_multistream_comm_context()
         if current_ms_metadata is None:
-            return self.o_proj(attn_output)[0]
+            if self.sp_size > 1:
+                return self.o_proj(attn_output, enable_sp=True)[0]
+            else:
+                return self.o_proj(attn_output)[0]
         else:
             current_ms_metadata.before_comm_event.record()
             with torch.npu.stream(current_ms_metadata.comm_stream):
                 current_ms_metadata.before_comm_event.wait()
-                return self.o_proj(attn_output)[0]
+                if self.sp_size > 1:
+                    return self.o_proj(attn_output, enable_sp=True)[0]
+                else:
+                    return self.o_proj(attn_output)[0]
 
     def exec_kv(
         self,

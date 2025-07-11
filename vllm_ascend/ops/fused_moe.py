@@ -1091,6 +1091,9 @@ class AscendFusedMoE(FusedMoE):
         self.log2phy = None
         self.global_redundant_expert_num = 0
 
+        self.sp_size = get_tensor_model_parallel_world_size()
+        self.sp_group = get_tp_group().device_group
+
         ascend_config = get_ascend_config()
         expert_map_path = ascend_config.expert_map_path
         if expert_map_path and os.path.exists(expert_map_path):
@@ -1196,7 +1199,7 @@ class AscendFusedMoE(FusedMoE):
         tp_size = get_tensor_model_parallel_world_size()
         if fused_moe_state == FusedMoEState.NO_OP:
             pass
-        elif tp_size > 1 and fused_moe_state != FusedMoEState.AllGather:
+        elif tp_size > 1 and fused_moe_state != FusedMoEState.AllGather and not self.sp_size > 1:
             if num_tokens < tp_size:
                 hidden_states = nn.functional.pad(
                     hidden_states, (0, 0, 0, tp_size - num_tokens))
@@ -1258,7 +1261,7 @@ class AscendFusedMoE(FusedMoE):
         # if tp_size > 1 and fused_moe_state != FusedMoEState.AllGather and fused_moe_state != FusedMoEState.NO_OP:
         if fused_moe_state == FusedMoEState.NO_OP:
             final_hidden_states = e_hidden_states
-        elif tp_size > 1 and fused_moe_state != FusedMoEState.AllGather:
+        elif tp_size > 1 and fused_moe_state != FusedMoEState.AllGather and not self.sp_size > 1:
             dist.all_gather(list(chunk_hidden_states), e_hidden_states,
                             self.tp_group)
             final_hidden_states = torch.cat(chunk_hidden_states, dim=0)
