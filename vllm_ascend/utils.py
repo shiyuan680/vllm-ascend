@@ -17,6 +17,7 @@
 # Adapted from vllm-project/vllm/vllm/worker/worker.py
 #
 
+import os
 import atexit
 import math
 from contextlib import contextmanager, nullcontext
@@ -282,11 +283,15 @@ class FusedMoEState(Enum):
     AllGather = 0
     All2All = 1
     MC2 = 2
+    NO_OP = 3
 
 
 # TODO(zzzzwwjj): add soc_version to choose branch
-def get_fused_moe_state(ep_size: int, with_prefill: bool):
-    if ep_size == 1:
+def get_fused_moe_state(ep_size: int, with_prefill: bool, not_Dummy=False):
+    if envs.VLLM_ENABLE_SP and not_Dummy:
+        return FusedMoEState.NO_OP
+    elif ep_size == 1:
+    # if ep_size == 1:
         return FusedMoEState.AllGather
     # NOTE: mc2 need ep_size >= 16 & all2all can't use in torchair graph.
     elif ep_size < 16 or with_prefill:

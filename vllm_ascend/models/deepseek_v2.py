@@ -28,6 +28,8 @@
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
+import torch.distributed as dist
+import torch.nn.functional as F
 import torch_npu
 import vllm.envs as envs
 from torch import nn
@@ -36,7 +38,10 @@ from vllm.attention import Attention, AttentionMetadata
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.distributed import (get_pp_group,
                               get_tensor_model_parallel_world_size,
-                              get_tp_group)
+                              get_tp_group, split_tensor_along_last_dim,
+                              tensor_model_parallel_all_gather,
+                              tensor_model_parallel_all_reduce,
+                              tensor_model_parallel_reduce_scatter)
 from vllm.distributed.parallel_state import get_dp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -132,6 +137,83 @@ class CustomDeepseekV2MergedReplicatedLinear(ReplicatedLinear):
         )
         shard.copy_(loaded_weight)
 
+class VocabParallelEmbeddingwithSP(VocabParallelEmbedding):
+
+    def forward(self, input_, enable_sp: bool = False):
+        if self.tp_size > 1:
+            masked_input, input_mask = get_masked_input_and_mask(
+                input_, self.shard_indices.org_vocab_start_index,
+                self.shard_indices.org_vocab_end_index,
+                self.shard_indices.num_org_vocab_padding,
+                self.shard_indices.added_vocab_start_index,
+                self.shard_indices.added_vocab_end_index
+            )
+        else:
+            masked_input = input_
+        output_parallel = self.quant_method.embedding(self,
+                                                      masked_input.long())
+        if self.tp_size > 1:
+            output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
+
+        if enable_sp:
+            sp_size = get_tensor_model_parallel_world_size()
+            original_len = input_.shape[0]
+
+            reminder = original_len % sp_size
+            if reminder != 0:
+                padding_len = sp_size - reminder
+                output_parallel = F.pad(output_parallel, (0, 0, 0, padding_len), mode='constant', value=0)
+
+            output = tensor_model_parallel_reduce_scatter(output_parallel.movedim(0, -1)).movedim(-1, 0)
+            return output, original_len
+        output = tensor_model_parallel_all_reduce(output_parallel)
+        return output
+
+class CustomDeepseekV2RowParallelLinear(RowParallelLinear):
+
+    def forward(
+        self,
+        input_,
+        is_prefill=True,
+        enable_sp: bool = False
+    ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[nn.Parameter]]]:
+
+        self.sp_size = get_tensor_model_parallel_world_size()
+        self.sp_group = get_tp_group.device_group
+
+        if self.input_is_parallel:
+            input_parallel = input_
+        else:
+            tp_rank = get_tensor_model_parallel_rank()
+            splitted_input = split_tensor_along_last_dim(
+                input_, num_partitions=self.tp_size)
+            input_parallel = splitted_input[tp_rank].contiguous()
+
+        assert self.quant_method is not None
+
+        bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+        output_parallel = self.quant_method.apply(self,
+                                                  input_parallel,
+                                                  bias=bias_)
+        if self.reduce_results and enable_sp:
+            sp_size = self.sp_size
+            original_len = input_.shape[0]
+            reminder = original_len  % sp_size
+            if reminder != 0:
+                padding_len = sp_size - reminder
+                output_parallel = F.pad(output_parallel, (0, 0, 0, padding_len), mode='constant', value=0)
+            output = tensor_model_parallel_reduce_scatter(output_parallel.movedim(0, -1)).movedim(-1, 0)
+        elif self.reduce_results and self.tp_size > 1:
+            output = tensor_model_parallel_all_reduce(output_parallel)
+        else:
+            output = output_parallel
+
+        output_bias = self.bias if self.skip_bias_add else None
+
+        if not self.return_bias:
+            return output
+        return output, output_bias
+
 
 class CustomDeepseekV2MLP(nn.Module):
 
@@ -146,7 +228,9 @@ class CustomDeepseekV2MLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        if not force_replicate:
+        self.sp_size = get_tensor_model_parallel_world_size()
+        self.sp_group = get_tp_group().device_group
+        if not force_replicate and not self.sp_size > 1:
             self.gate_up_proj = MergedColumnParallelLinear(
                 hidden_size, [intermediate_size] * 2,
                 bias=False,
@@ -365,6 +449,9 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
+        self.sp_size = get_tensor_model_parallel_world_size()
+        self.sp_group = get_tp_group().device_group
+
         if self.q_lora_rank is not None:
             self.q_a_proj = ReplicatedLinear(self.hidden_size,
                                              self.q_lora_rank,
@@ -401,7 +488,7 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.kv_b_proj")
-        self.o_proj = RowParallelLinear(self.num_heads * self.v_head_dim,
+        self.o_proj = CustomDeepseekV2RowParallelLinear(self.num_heads * self.v_head_dim,
                                         self.hidden_size,
                                         bias=False,
                                         quant_config=quant_config,
@@ -461,10 +548,16 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
 
     def forward(
             self,
+            original_len: int,
             positions: torch.Tensor,
             hidden_states: torch.Tensor,
             kv_cache: Optional[torch.Tensor] = None,
             attn_metadata: Optional[AttentionMetadata] = None) -> torch.Tensor:
+        s_prefill = 0
+        attn_metadata = get_forward_context().attn_metadata
+        if attn_metadata:
+            is_prefill = attn_metadata.num_prefills
+
         if self.q_lora_rank is not None:
             ckq = self.q_a_proj(hidden_states)[0]
             use_multistream_mla = (self.enable_multistream_mla
@@ -495,8 +588,20 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
                 output = output.view(-1, output_shape[-1])
             return output
         else:
-            kv_c, k_pe = self.kv_a_proj_with_mqa(hidden_states)[0].split(
-                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+            kv_c_k_pe = self.kv_a_proj_with_mqa(hidden_states)[0]
+            if self.sp_size > 1 and is_prefill:
+                chunk_kv_c_k_pe = [torch.empty_like(kv_c_k_pe) for _ in range(self.sp_size)]
+                dist.all_gather(list(chunk_kv_c_k_pe), kv_c_k_pe, self.sp_group)
+                kv_c_k_pe = torch.cat(chunk_kv_c_k_pe, dim=0)
+                kv_c_k_pe = kv_c_k_pe[:original_len]
+
+                chunk_hidden_states_or_q_c = [torch.empty_like(hidden_states_or_q_c) for _ in range(self.sp_size)]
+                dist.all_gather(list(chunk_hidden_states_or_q_c), hidden_states_or_q_c, self.sp_group)
+                hidden_states_or_q_c = torch.cat(chunk_hidden_states_or_q_c, dim=0)
+                hidden_states_or_q_c = hidden_states_or_q_c[:original_len]
+            kv_c, k_pe = kv_c_k_pe.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+            # kv_c, k_pe = self.kv_a_proj_with_mqa(hidden_states)[0].split(
+            #     [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
             kv_c_normed = self.kv_a_layernorm(kv_c.contiguous())
             return self.mla_attn(hidden_states_or_q_c,
                                  kv_c_normed,
@@ -571,6 +676,7 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
 
     def forward(
         self,
+        original_len: int,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
@@ -591,6 +697,7 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
             dispose_tensor(previous_residual)
 
         hidden_states = self.self_attn(
+            original_len=original_len,
             positions=positions,
             hidden_states=hidden_states,
             kv_cache=kv_cache,
@@ -644,8 +751,11 @@ class CustomDeepseekV2Model(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
+        self.sp_size = get_tensor_model_parallel_world_size()
+        self.sp_group = get_tp_group().device_group
+
         if get_pp_group().is_first_rank:
-            self.embed_tokens = VocabParallelEmbedding(
+            self.embed_tokens = VocabParallelEmbeddingwithSP(
                 config.vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
@@ -684,11 +794,21 @@ class CustomDeepseekV2Model(nn.Module):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
+
+        original_len = 1
+        is_prefill = 0
+        attn_metadata = get_forward_context().attn_metadata
+        if attn_metadata:
+            is_prefill = attn_metadata.num_prefills
+
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
-                hidden_states = self.get_input_embeddings(input_ids)
+                if self.sp_size > 1 and is_prefill:
+                    hidden_states, original_len = self.embed_tokens(input_=input_ids, enable_sp=True)
+                else:
+                    hidden_states = self.get_input_embeddings(input_ids)
             residual = None
         else:
             assert intermediate_tensors is not None
@@ -697,7 +817,7 @@ class CustomDeepseekV2Model(nn.Module):
 
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
-            hidden_states, residual = layer(
+            original_len, hidden_states, residual = layer(
                 positions, hidden_states, residual,
                 kv_caches[i -
                           self.start_layer] if kv_caches is not None else None,
@@ -710,6 +830,12 @@ class CustomDeepseekV2Model(nn.Module):
             })
 
         hidden_states, _ = self.norm(hidden_states, residual)
+
+        if self.sp_size > 1 and is_prefill:
+            chunk_hidden_states = [torch.empty_like(hidden_states) for _ in range(self.sp_size)]
+            dist.all_gather(list(chunk_hidden_states), hidden_states, self.sp_group)
+            hidden_states = torch.cat(chunk_hidden_states, dim=0)
+            hidden_states = hidden_states[:original_len]
         return hidden_states
 
 
