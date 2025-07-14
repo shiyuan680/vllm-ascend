@@ -19,17 +19,21 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Type
 
+import numpy as np
 import torch
 import torch_npu
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionLayer, AttentionType)
-from vllm.attention.backends.utils import CommonAttentionState
+from vllm.attention.backends.utils import CommonAttentionState, PAD_SLOT_ID
+from vllm.config import get_current_vllm_config
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.utils import direct_register_custom_op
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu_input_batch import InputBatch
 
 from vllm_ascend.ops.attention import vanilla_chunked_prefill
+from vllm_ascend.utils import get_graph_params
+from vllm_ascend.ascend_config import get_ascend_config
 
 
 class AscendAttentionBackend(AttentionBackend):
@@ -136,7 +140,9 @@ class AscendMetadata:
     # For logging.
     num_input_tokens: int = 0  # Number of tokens including padding.
 
+    enable_dbo_across_dp: bool = False
     with_prefill_across_dp: bool = False
+    use_torchair_graph: bool = False
 
 
 class AscendAttentionMetadataBuilder:
@@ -147,6 +153,32 @@ class AscendAttentionMetadataBuilder:
     def reorder_batch(self, input_batch: "InputBatch",
                       scheduler_output: "SchedulerOutput") -> bool:
         return False
+
+    def _get_graph_runner_block_tables(
+            self, num_seqs: int, block_tables: torch.Tensor) -> torch.Tensor:
+
+        max_batch_size, max_blocks = self.runner.graph_block_tables.shape
+        assert max_batch_size >= num_seqs
+
+        if isinstance(self.runner.graph_block_tables, np.ndarray):
+            graph_block_tables = torch.zeros((max_batch_size, max_blocks),
+                                             dtype=block_tables.dtype,
+                                             device=block_tables.device)
+        else:
+            graph_block_tables = self.runner.graph_block_tables.to(
+                device=block_tables.device, dtype=block_tables.dtype)
+
+        num_blocks = block_tables.size(1)
+        if num_blocks <= max_blocks:
+            graph_block_tables[:num_seqs, :
+                               num_blocks] = block_tables[:num_seqs, :
+                                                          num_blocks]
+        else:
+            graph_block_tables[:num_seqs, :
+                               max_blocks] = block_tables[:num_seqs, :
+                                                          max_blocks]
+
+        return graph_block_tables[:num_seqs, :max_blocks]
 
     def build(self,
               num_reqs,
@@ -171,6 +203,38 @@ class AscendAttentionMetadataBuilder:
         query_start_loc = query_start_loc_cpu.to(self.runner.device,
                                                  non_blocking=True)
 
+        graph_pad_size = kwargs.get("graph_pad_size", -1)
+        with_prefill_across_dp = kwargs["with_prefill_across_dp"]
+        use_torchair_graph = graph_pad_size != -1
+        if not with_prefill_across_dp:
+            if use_torchair_graph and self.runner.attn_state in [
+                    AscendAttentionState.DecodeOnly,
+                    AscendAttentionState.SpecDecoding
+            ]:
+                num_seqs = len(seq_lens)
+                if graph_pad_size != 0:
+                    pad_value = 1
+                    padded_seq_lens = seq_lens.tolist() + [pad_value
+                                                           ] * graph_pad_size
+                else:
+                    padded_seq_lens = seq_lens.tolist()
+
+                seq_lens = torch.from_numpy(
+                    np.array(padded_seq_lens).astype(np.int32))
+                padding = torch.full((graph_pad_size, ),
+                                     PAD_SLOT_ID,
+                                     dtype=slot_mapping.dtype,
+                                     device=slot_mapping.device)
+                slot_mapping = torch.cat([slot_mapping, padding])
+                block_table_padding = torch.zeros(
+                    (graph_pad_size, ) + block_table.shape[1:],
+                    dtype=block_table.dtype,
+                    device=block_table.device)
+                block_table = torch.cat([block_table, block_table_padding],
+                                        dim=0)
+                block_table = self._get_graph_runner_block_tables(
+                    num_seqs + graph_pad_size, block_table)
+
         attn_metadata = AscendMetadata(
             num_actual_tokens=num_actual_tokens,
             block_tables=block_table,
@@ -182,7 +246,43 @@ class AscendAttentionMetadataBuilder:
             attn_mask=attn_mask,
             attn_state=attn_state,
             max_num_tokens_across_dp=max_num_tokens_across_dp,
-            with_prefill_across_dp=with_prefill_across_dp)
+            with_prefill_across_dp=with_prefill_across_dp,
+            use_torchair_graph=use_torchair_graph
+        )
+        return attn_metadata
+
+    def build_torchair_graph_dummy(self, num_reqs: int, num_actual_tokens: int):
+        device = self.runner.device
+        _, max_blocks = self.runner.graph_block_tables.shape
+        block_table = torch.zeros((num_reqs, max_blocks),
+                                  dtype=torch.int32,
+                                  device=device)
+        block_table = self._get_graph_runner_block_tables(
+            num_reqs, block_table)
+        seq_lens = torch.ones(num_reqs, dtype=torch.int32, device=device)
+        slot_mapping = torch.full((num_reqs, ),
+                                  PAD_SLOT_ID,
+                                  dtype=torch.int32,
+                                  device=device)
+        query_start_loc = torch.full((num_reqs, ),
+                                     -1,
+                                     dtype=torch.int32,
+                                     device=device)
+
+        query_lens = torch.ones(num_reqs, dtype=torch.int32, device=device)
+        attn_mask = self.runner.attn_mask
+
+        attn_metadata = AscendMetadata(
+            num_actual_tokens=num_actual_tokens,
+            block_tables=block_table,
+            query_start_loc=query_start_loc,
+            query_lens=query_lens,
+            seq_lens=seq_lens,
+            seq_lens_list=seq_lens.tolist(),
+            max_query_len=query_lens.max().item(),
+            slot_mapping=slot_mapping,
+            attn_mask=attn_mask,
+            attn_state=AscendAttentionState.DecodeOnly)
         return attn_metadata
 
 
@@ -202,6 +302,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         attn_type: str = AttentionType.DECODER,
         kv_sharing_target_layer_name: Optional[str] = None,
         use_irope: bool = False,
+        prefix: Optional[str] = None,
     ) -> None:
         self.num_heads = num_heads
         self.head_size = head_size
@@ -221,6 +322,29 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
         self.key_cache = None
         self.value_cache = None
+        ascend_config = get_ascend_config()
+        self.torchair_graph_enabled = ascend_config.torchair_graph_config.enabled
+
+    def update_kv_cache(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        slot_indices: torch.Tensor
+    ) -> None:
+        # calc indices by block_size
+        block_size = key_cache.shape[1]
+        slot_indices = slot_indices.view(-1,1,1).to(torch.int64)
+        block_idx = torch.div(slot_indices, block_size, rounding_mode='floor')
+        block_offset = slot_indices % block_size
+        indices = torch.cat([block_idx, block_offset], dim=2)
+        indices = indices.npu()
+
+        # [blocknum, blocksize, numKvHeads, headDims]
+        # -> [blocknum, blocksize, numKvHeads * headDims]
+        torch_npu.npu_scatter_nd_update_(key_cache, indices, key)
+        torch_npu.npu_scatter_nd_update_(value_cache, indices, value)
 
     def forward(
         self,
@@ -284,12 +408,18 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 if self.key_cache is None:
                     self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
                 slots = attn_metadata.slot_mapping
-                torch_npu._npu_reshape_and_cache(
-                    key=key[:num_actual_tokens],
-                    value=value[:num_actual_tokens],
-                    key_cache=self.key_cache,
-                    value_cache=self.value_cache,
-                    slot_indices=slots)
+                if not attn_metadata.with_prefill_across_dp and self.torchair_graph_enabled:
+                    self.update_kv_cache(key=key,
+                                         value=value,
+                                         key_cache=self.key_cache,
+                                         value_cache=self.value_cache,
+                                         slot_indices=slots.to(torch.int64))
+                else:
+                    torch_npu._npu_reshape_and_cache(key=key[:num_actual_tokens],
+                                                     value=value[:num_actual_tokens],
+                                                     key_cache=self.key_cache,
+                                                     value_cache=self.value_cache,
+                                                     slot_indices=slots)
 
             if hasattr(layer, 'quant_method'):
                 # TODO: Add attr (num_prefills, prefill_metadata, decode_metadata) to AscendMetadata
@@ -325,16 +455,35 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     scale_value=self.scale,
                     out=output)
             elif attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
-                torch_npu._npu_paged_attention(
-                    query=query,
-                    key_cache=self.key_cache,
-                    value_cache=self.value_cache,
-                    num_kv_heads=self.num_kv_heads,
-                    num_heads=self.num_heads,
-                    scale_value=self.scale,
-                    block_table=attn_metadata.block_tables,
-                    context_lens=attn_metadata.seq_lens,
-                    out=output)
+                if self.torchair_graph_enabled:
+                    # query change to BSND
+                    query = query.view(-1, 1, self.num_heads * self.head_size)
+                    # [blocknum, numKvHeads, blocksize, headDims] -> [blocknum, blocksize, numKvHeads * headDims]
+                    key_cache = self.key_cache.view(*self.key_cache.shape[:-2], -1)
+                    value_cache = self.value_cache.view(*self.value_cache.shape[:-2], -1)
+
+                    output = torch_npu.npu_incre_flash_attention(
+                        query=query,
+                        key=key_cache,
+                        value=value_cache,
+                        num_heads=self.num_heads,
+                        num_key_value_heads=self.num_kv_heads,
+                        input_layout='BSH',
+                        scale_value=self.scale,
+                        actual_seq_lengths=attn_metadata.seq_lens_list,
+                        block_table=attn_metadata.block_tables,
+                        block_size=kv_cache[0].shape[1],)
+                else:
+                    torch_npu._npu_paged_attention(
+                        query=query,
+                        key_cache=self.key_cache,
+                        value_cache=self.value_cache,
+                        num_kv_heads=self.num_kv_heads,
+                        num_heads=self.num_heads,
+                        scale_value=self.scale,
+                        block_table=attn_metadata.block_tables,
+                        context_lens=attn_metadata.seq_lens,
+                        out=output)
             # Normal V1 situation.
             else:
                 # use chunked prefill for head size 192 scenario, like deepseek
