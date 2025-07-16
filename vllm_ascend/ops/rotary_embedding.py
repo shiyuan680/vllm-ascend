@@ -250,6 +250,30 @@ def __set_cos_sin_cache(self, seq_len, device, dtype):
     self.register_buffer("sin", emb.sin().to(dtype=dtype), persistent=False)
     self.embed = F.embedding
 
+def qwen_rope_init_func(
+    self,
+    head_size: int,
+    rotary_dim: int,
+    max_position_embeddings: int,
+    base: float,
+    is_neox_style: bool,
+    dtype: torch.dtype,
+) -> None:
+    super(RotaryEmbedding, self).__init__()
+    self.head_size = head_size
+    self.rotary_dim = rotary_dim
+    self.max_position_embeddings = max_position_embeddings
+    self.base = base
+    self.is_neox_style = is_neox_style
+    self.dtype = dtype
+
+    cache = self._compute_cos_sin_cache()
+    cache = cache.to(dtype)
+    if get_ascend_config().torchair_graph_config.enabled:
+        __set_cos_sin_cache(self, seq_len=max_position_embeddings, device="npu", dtype=dtype)
+    else:
+        self.cos_sin_cache: torch.Tensor
+        self.register_buffer("cos_sin_cache", cache, persistent=False)
 
 def rope_forward(
         self,

@@ -19,21 +19,22 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Type
 
+import os
 import numpy as np
 import torch
 import torch_npu
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionLayer, AttentionType)
 from vllm.attention.backends.utils import CommonAttentionState, PAD_SLOT_ID
-from vllm.config import get_current_vllm_config
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.utils import direct_register_custom_op
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu_input_batch import InputBatch
 
 from vllm_ascend.ops.attention import vanilla_chunked_prefill
-from vllm_ascend.utils import get_graph_params
 from vllm_ascend.ascend_config import get_ascend_config
+
+VLLM_USE_ACL_GRAPH = os.environ.get("VLLM_USE_ACL_GRAPH", 0)
 
 
 class AscendAttentionBackend(AttentionBackend):
@@ -118,6 +119,7 @@ class AscendMetadata:
     query_start_loc: torch.Tensor
     query_lens: torch.Tensor
     seq_lens: torch.Tensor
+    seq_lens_list: list[int]
     # max value of number of tokens across dp group
     max_num_tokens_across_dp: int = 0
 
@@ -185,6 +187,7 @@ class AscendAttentionMetadataBuilder:
               num_actual_tokens,
               max_query_len,
               common_prefix_len,
+              graph_pad_size: int = -1,
               max_num_tokens_across_dp: int = 0,
               with_prefill_across_dp: bool = False):
 
@@ -203,8 +206,6 @@ class AscendAttentionMetadataBuilder:
         query_start_loc = query_start_loc_cpu.to(self.runner.device,
                                                  non_blocking=True)
 
-        graph_pad_size = kwargs.get("graph_pad_size", -1)
-        with_prefill_across_dp = kwargs["with_prefill_across_dp"]
         use_torchair_graph = graph_pad_size != -1
         if not with_prefill_across_dp:
             if use_torchair_graph and self.runner.attn_state in [
@@ -241,6 +242,7 @@ class AscendAttentionMetadataBuilder:
             query_start_loc=query_start_loc,
             query_lens=query_lens,
             seq_lens=seq_lens,
+            seq_lens_list=seq_lens.tolist(),
             max_query_len=max_query_len,
             slot_mapping=slot_mapping,
             attn_mask=attn_mask,
@@ -251,7 +253,7 @@ class AscendAttentionMetadataBuilder:
         )
         return attn_metadata
 
-    def build_torchair_graph_dummy(self, num_reqs: int, num_actual_tokens: int):
+    def build_dummy(self, num_reqs: int, num_actual_tokens: int):
         device = self.runner.device
         _, max_blocks = self.runner.graph_block_tables.shape
         block_table = torch.zeros((num_reqs, max_blocks),
@@ -346,6 +348,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
         torch_npu.npu_scatter_nd_update_(key_cache, indices, key)
         torch_npu.npu_scatter_nd_update_(value_cache, indices, value)
 
+    def _bsh_to_bnsd(self, x, num_heads):
+        B, S, H = x.shape
+        D = H // num_heads
+        assert H % num_heads == 0, "hidden dim must be divisible by num_heads"
+        return x.view(B, S, num_heads, D).permute(0, 2, 1, 3)  # BNSD
+
+
     def forward(
         self,
         layer: AttentionLayer,
@@ -379,6 +388,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                  self.head_size,
                                  dtype=query.dtype,
                                  device=query.device)
+        assert output is not None, "Output tensor must be provided."
         if trace_flag:
             torch.ops.vllm.unified_ascend_attention_with_output(
                 query=query,
@@ -462,17 +472,44 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     key_cache = self.key_cache.view(*self.key_cache.shape[:-2], -1)
                     value_cache = self.value_cache.view(*self.value_cache.shape[:-2], -1)
 
-                    output = torch_npu.npu_incre_flash_attention(
-                        query=query,
-                        key=key_cache,
-                        value=value_cache,
-                        num_heads=self.num_heads,
-                        num_key_value_heads=self.num_kv_heads,
-                        input_layout='BSH',
-                        scale_value=self.scale,
-                        actual_seq_lengths=attn_metadata.seq_lens_list,
-                        block_table=attn_metadata.block_tables,
-                        block_size=kv_cache[0].shape[1],)
+                    if VLLM_USE_ACL_GRAPH == '1':
+                        q = self._bsh_to_bnsd(query, self.num_heads)
+                        k = self._bsh_to_bnsd(key_cache, self.num_kv_heads)                        
+                        v = self._bsh_to_bnsd(value_cache, self.num_kv_heads)
+                        output, _ = torch_npu.npu_fused_infer_attention_score(
+                            query=q,
+                            key=k,
+                            value=v,
+                            query_rope=None, # todo
+                            key_rope=None, # todo
+                            num_heads=self.num_heads,
+                            num_key_value_heads=self.num_kv_heads,
+                            # input_layout='BSH',
+                            input_layout='BNSD',
+                            atten_mask=attn_metadata.attn_mask, # done
+                            sparse_mode=0, # todo
+                            scale=self.scale,
+                            antiquant_mode=0,
+                            antiquant_scale=None,
+                            block_table=attn_metadata.block_tables,
+                            block_size=kv_cache[0].shape[1],
+                            actual_seq_lengths_kv=attn_metadata.seq_lens_list, # done
+                        )
+                    else:
+                        output = torch_npu.npu_incre_flash_attention(
+                            query=query,
+                            key=key_cache,
+                            value=value_cache,
+                            num_heads=self.num_heads,
+                            num_key_value_heads=self.num_kv_heads,
+                            # input_layout='BNSD',
+                            input_layout='BSH',
+                            # scale=self.scale,
+                            scale_value=self.scale,
+                            # actual_seq_lengths_kv=attn_metadata.seq_lens_list,
+                            actual_seq_lengths=attn_metadata.seq_lens_list,
+                            block_table=attn_metadata.block_tables,
+                            block_size=kv_cache[0].shape[1],)
                 else:
                     torch_npu._npu_paged_attention(
                         query=query,

@@ -651,7 +651,7 @@ def fused_experts(
                             num_experts)).to(topk_ids.dtype)
 
         # Sort by local expert IDs
-        sort_indices = torch.argsort(filtered_experts.view(torch.float32))
+        sort_indices = torch.argsort(filtered_experts)
         sorted_token_indices = token_indices[sort_indices]
         sorted_weights = filtered_weights[sort_indices]
 
@@ -961,8 +961,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # this is a naive implementation for experts load balance so as
         # to avoid accumulating too much tokens on a single rank.
         # currently it is only activated when doing profile runs.
-        if enable_force_load_balance:
-            topk_ids = torch.randint_like(topk_ids, 0, global_num_experts)
+        # if enable_force_load_balance:
+        #     topk_ids = torch.randint_like(topk_ids, 0, global_num_experts)
 
         fused_moe_state = get_fused_moe_state(self.ep_group.world_size,
                                               is_prefill)

@@ -121,7 +121,7 @@ class AscendQwen3MoeSparseMoeBlock(nn.Module):
             is_prefill = True
             enable_force_load_balance = True
         else:
-            enable_force_load_balance = True
+            enable_force_load_balance = False
             if hasattr(attn_metadata, 'with_prefill_across_dp'):
                 is_prefill = attn_metadata.with_prefill_across_dp
                 enable_force_load_balance = is_prefill
