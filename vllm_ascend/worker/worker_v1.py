@@ -301,8 +301,9 @@ class NPUWorker(WorkerBase):
                     torch_npu.profiler.ProfilerActivity.NPU,
                 ],
                 with_stack=False,
-                profile_memory=False,
+                profile_memory=True,
                 with_modules=False,
+                record_shapes=True,
                 experimental_config=experimental_config,
                 on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
                     torch_profiler_trace_dir))
