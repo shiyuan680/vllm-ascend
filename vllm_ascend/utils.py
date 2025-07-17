@@ -19,6 +19,7 @@
 
 import atexit
 import math
+import os
 from contextlib import contextmanager, nullcontext
 from enum import Enum
 from threading import Lock
@@ -31,6 +32,7 @@ from torch_npu.npu.streams import Event
 from vllm.logger import logger
 
 import vllm_ascend.envs as envs
+
 
 try:
     # Recent release of torchair has moved these ops to `.scope`.

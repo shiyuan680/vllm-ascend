@@ -27,8 +27,6 @@ from vllm.distributed import (GroupCoordinator, get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
                               tensor_model_parallel_all_reduce)
 from vllm.distributed.parallel_state import get_dp_group, get_tp_group
-from vllm_ascend.ops.moe_dispatcher.token_dispatcher import (
-    MoEAlltoAllSeqOverLapDispatcher, MoeDispatcherConfig)
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe.layer import (
     FusedMoE, FusedMoEParallelConfig, MoEConfig, UnquantizedFusedMoEMethod,
@@ -45,7 +43,6 @@ from vllm_ascend.utils import (FusedMoEState, dispose_tensor,
                                npu_wait_tensor)
 
 MOE_ALL2ALL_BUFFER: bool = envs_ascend.MOE_ALL2ALL_BUFFER
-ENABLE_MOE_ALLTOALLV: bool = envs_ascend.ENABLE_MOE_ALLTOALLV
 
 
 def process_topk_ids(topk_ids: torch.Tensor, expert_num: int, ep_size: int,
@@ -633,6 +630,7 @@ def fused_experts(
                             num_experts)).to(topk_ids.dtype)
 
         # Sort by local expert IDs
+        #sort_indices = torch.argsort(filtered_experts.view(torch.float32))
         sort_indices = torch.argsort(filtered_experts)
         sorted_token_indices = token_indices[sort_indices]
         sorted_weights = filtered_weights[sort_indices]
@@ -948,7 +946,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
 
         fused_moe_state = get_fused_moe_state(self.ep_group.world_size,
                                               is_prefill)
-        
+
         if fused_moe_state == FusedMoEState.MC2:
             return fused_experts_with_mc2(
                 hidden_states=x,
@@ -1203,7 +1201,6 @@ class AscendFusedMoE(FusedMoE):
             global_redundant_expert_num=self.global_redundant_expert_num,
             shared_experts=shared_experts if self.torchair_graph_enabled
             and self.enable_multistream_moe and not is_prefill else None,
-            token_dispatcher=self.token_dispatcher
         )
 
         if shared_experts:

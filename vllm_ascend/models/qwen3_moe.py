@@ -16,12 +16,15 @@
 # Adapted from vllm/model_executor/models/qwen3_moe.py
 # This file is a part of the vllm-ascend project.
 
-from typing import Any, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
+import torch.distributed as dist
+import torch_npu
 import vllm
 import vllm.envs as envs
 from torch import nn
+from transformers import PretrainedConfig
 from vllm.attention import AttentionMetadata
 from vllm.distributed import (get_tensor_model_parallel_world_size,
                               get_tp_group)
@@ -42,16 +45,15 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.sequence import IntermediateTensors
 
 from vllm.model_executor.models.utils import (extract_layer_index,
-                                              make_empty_intermediate_tensors_factory, make_layers,
-                                              maybe_prefix)
+                    make_empty_intermediate_tensors_factory, make_layers,
+                    maybe_prefix)
 from vllm.model_executor.models.qwen3_moe import (Qwen3MoeAttention,
                                                   Qwen3MoeDecoderLayer,
                                                   Qwen3MoeModel,
-                                                  Qwen3MoeSparseMoeBlock,  # noqa: F401
-                                                  Qwen3MoeMLP)
+                                                  Qwen3MoeSparseMoeBlock)
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm.distributed import get_ep_group
+from vllm_ascend.distributed.parallel_state import get_ep_group
 from vllm_ascend.ops.fused_moe import AscendFusedMoE
 
 from vllm.model_executor.models.qwen3_moe import Qwen3MoeForCausalLM
@@ -61,13 +63,14 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 
 
 class AscendQwen3MoeSparseMoeBlock(nn.Module):
+    
     top_k: int
 
     def __init__(
-            self,
-            config: PretrainedConfig,
-            quant_config: Optional[QuantizationConfig] = None,
-            prefix: str = "",
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -97,6 +100,7 @@ class AscendQwen3MoeSparseMoeBlock(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.experts")
 
+        
         self.top_k = config.num_experts_per_tok
 
         self.dp_size = get_dp_group().world_size
@@ -121,11 +125,12 @@ class AscendQwen3MoeSparseMoeBlock(nn.Module):
             is_prefill = True
             enable_force_load_balance = True
         else:
+            # is_prefill = attn_metadata.num_prefills > 0 is_prefill or
             enable_force_load_balance = False
             if hasattr(attn_metadata, 'with_prefill_across_dp'):
                 is_prefill = attn_metadata.with_prefill_across_dp
-                enable_force_load_balance = is_prefill
 
+        # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
 
         hidden_states = self.experts(
@@ -142,23 +147,22 @@ class AscendQwen3MoeSparseMoeBlock(nn.Module):
 
 vllm.model_executor.models.qwen3_moe.Qwen3MoeSparseMoeBlock = AscendQwen3MoeSparseMoeBlock
 
-
 class CustomQwen3MoeAttention(Qwen3MoeAttention):
 
     def __init__(
-            self,
-            hidden_size: int,
-            num_heads: int,
-            num_kv_heads: int,
-            rope_theta: float = 10000,
-            rope_scaling: Optional[dict[str, Any]] = None,
-            max_position_embeddings: int = 8192,
-            head_dim: Optional[int] = None,
-            rms_norm_eps: float = 1e-06,
-            qkv_bias: bool = False,
-            cache_config: Optional[CacheConfig] = None,
-            quant_config: Optional[QuantizationConfig] = None,
-            prefix: str = "",
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        rope_theta: float = 10000,
+        rope_scaling: Optional[dict[str, Any]] = None,
+        max_position_embeddings: int = 8192,
+        head_dim: Optional[int] = None,
+        rms_norm_eps: float = 1e-06,
+        qkv_bias: bool = False,
+        cache_config: Optional[CacheConfig] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
         self.hidden_size = hidden_size
@@ -179,7 +183,7 @@ class CustomQwen3MoeAttention(Qwen3MoeAttention):
         self.head_dim = head_dim or (hidden_size // self.total_num_heads)
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
@@ -218,11 +222,11 @@ class CustomQwen3MoeAttention(Qwen3MoeAttention):
         self.torchair_graph_enabled = ascend_config.torchair_graph_config.enabled
 
     def forward(
-            self,
-            positions: torch.Tensor,
-            hidden_states: torch.Tensor,
-            kv_cache: Optional[torch.Tensor] = None,
-            attn_metadata: Optional[AttentionMetadata] = None
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        kv_cache: Optional[torch.Tensor] = None,
+        attn_metadata: Optional[AttentionMetadata] = None
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -252,8 +256,9 @@ class CustomQwen3MoeAttention(Qwen3MoeAttention):
             attn_output = self.attn.impl.forward(self.attn, q, k, v,
                                                  kv_cache=kv_cache,
                                                  attn_metadata=attn_metadata,
-                                                 trace_flag=False,
-                                                 **forward_kwargs)
+                                                 **forward_kwargs, trace_flag=False)
+            # if envs.VLLM_USE_V1:
+            #     output = output.view(-1, output_shape[-1])
             output, _ = self.o_proj(attn_output)
             return output
         else:
@@ -261,15 +266,14 @@ class CustomQwen3MoeAttention(Qwen3MoeAttention):
             output, _ = self.o_proj(attn_output)
             return output
 
-
 class CustomQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
 
     def __init__(
-            self,
-            config: PretrainedConfig,
-            cache_config: Optional[CacheConfig] = None,
-            quant_config: Optional[QuantizationConfig] = None,
-            prefix: str = "",
+        self,
+        config: PretrainedConfig,
+        cache_config: Optional[CacheConfig] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
         self.hidden_size = config.hidden_size
@@ -298,7 +302,7 @@ class CustomQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
                            config.mlp_only_layers)
         if (layer_idx not in mlp_only_layers) and (
                 config.num_experts > 0 and
-                (layer_idx + 1) % config.decoder_sparse_step == 0):
+            (layer_idx + 1) % config.decoder_sparse_step == 0):
             self.mlp = AscendQwen3MoeSparseMoeBlock(config=config,
                                                     quant_config=quant_config,
                                                     prefix=f"{prefix}.mlp")
@@ -314,12 +318,12 @@ class CustomQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
                                                 eps=config.rms_norm_eps)
 
     def forward(
-            self,
-            positions: torch.Tensor,
-            hidden_states: torch.Tensor,
-            residual: Optional[torch.Tensor] = None,
-            kv_cache: Optional[torch.Tensor] = None,
-            attn_metadata: Optional[AttentionMetadata] = None,
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        kv_cache: Optional[torch.Tensor] = None,
+        attn_metadata: Optional[AttentionMetadata] = None,
     ) -> torch.Tensor:
         # Self Attention
         if residual is None:
@@ -340,7 +344,6 @@ class CustomQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
             hidden_states, residual)
         hidden_states = self.mlp(hidden_states, attn_metadata)
         return hidden_states, residual
-
 
 @support_torch_compile
 class CustomQwen3MoeModel(Qwen3MoeModel):
@@ -376,13 +379,13 @@ class CustomQwen3MoeModel(Qwen3MoeModel):
         return self.embed_tokens(input_ids)
 
     def forward(
-            self,
-            input_ids: torch.Tensor,
-            positions: torch.Tensor,
-            kv_caches: Optional[List[torch.Tensor]] = None,
-            attn_metadata: Optional[AttentionMetadata] = None,
-            intermediate_tensors: Optional[IntermediateTensors] = None,
-            inputs_embeds: Optional[torch.Tensor] = None,
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        kv_caches: Optional[List[torch.Tensor]] = None,
+        attn_metadata: Optional[AttentionMetadata] = None,
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -411,7 +414,6 @@ class CustomQwen3MoeModel(Qwen3MoeModel):
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
-
 class CustomQwen3MoeForCausalLM(Qwen3MoeForCausalLM):
     packed_modules_mapping = {
         "qkv_proj": [
@@ -424,7 +426,7 @@ class CustomQwen3MoeForCausalLM(Qwen3MoeForCausalLM):
             "up_proj",
         ],
         "experts":
-            ["experts.0.gate_proj", "experts.0.up_proj", "experts.0.down_proj"],
+        ["experts.0.gate_proj", "experts.0.up_proj", "experts.0.down_proj"],
     }
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -434,7 +436,7 @@ class CustomQwen3MoeForCausalLM(Qwen3MoeForCausalLM):
         self.config = config
         self.quant_config = quant_config
         self.model = CustomQwen3MoeModel(vllm_config=vllm_config,
-                                         prefix=maybe_prefix(prefix, "model"))
+                                   prefix=maybe_prefix(prefix, "model"))
         self.lm_head = ParallelLMHead(config.vocab_size,
                                       config.hidden_size,
                                       quant_config=quant_config)
@@ -445,13 +447,13 @@ class CustomQwen3MoeForCausalLM(Qwen3MoeForCausalLM):
             self.model.make_empty_intermediate_tensors)
 
     def forward(
-            self,
-            input_ids: torch.Tensor,
-            positions: torch.Tensor,
-            kv_caches: Optional[List[torch.Tensor]] = None,
-            attn_metadata: Optional[AttentionMetadata] = None,
-            intermediate_tensors: Optional[IntermediateTensors] = None,
-            inputs_embeds: Optional[torch.Tensor] = None,
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        kv_caches: Optional[List[torch.Tensor]] = None,
+        attn_metadata: Optional[AttentionMetadata] = None,
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         hidden_states = self.model(input_ids, positions, kv_caches,
                                    attn_metadata, intermediate_tensors,

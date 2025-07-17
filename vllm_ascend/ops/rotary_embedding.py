@@ -20,6 +20,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch_npu
+import torch.nn as nn
 import torch.nn.functional as F
 from vllm.model_executor.layers.rotary_embedding import (
     DeepseekScalingRotaryEmbedding, RotaryEmbedding)
@@ -239,7 +240,7 @@ def _set_cos_sin_cache(self, seq_len, device, dtype):
     self.register_buffer("sin_cached", sin_cached, persistent=False)
 
 def __set_cos_sin_cache(self, seq_len, device, dtype):
-    inv_freq = 1.0 / (self.base ** (torch.arange(0, self.rotary_dim, 2).float().npu() * (1 / self.rotary_dim)))
+    inv_freq = 1.0 / (self.base ** (torch.arange(0, self.rotary_dim, 2, device=device, dtype=dtype) * (1 / self.rotary_dim)))
     self.register_buffer("inv_freq", inv_freq)
 
     t = torch.arange(self.max_position_embeddings, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
@@ -276,24 +277,27 @@ def qwen_rope_init_func(
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
 def rope_forward(
-        self,
-        positions_ids: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        offsets: Optional[torch.Tensor] = None,
-        max_seq_len: Optional[int] = None
+    self,
+    positions_ids: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    offsets: Optional[torch.Tensor] = None,
+    max_seq_len: Optional[int] = None
 ):
     if not get_ascend_config().torchair_graph_config.enabled:
         return rope_forward_oot(self, positions_ids, query, key, offsets, max_seq_len)
-    if max_seq_len is not None and max_seq_len > self.max_position_embeddings:
+
+    if max_seq_len is not None and torch.gt(max_seq_len, self.max_position_embeddings):
         __set_cos_sin_cache(self, seq_len=max_seq_len, device=query.device, dtype=query.dtype)
 
-    # bsnd/bnsd
+    # b s n d/b n s d
     if positions_ids is not None:
         cos = self.embed(positions_ids, self.cos)
         sin = self.embed(positions_ids, self.sin)
         self.cos_embed = cos
         self.sin_embed = sin
+        # [128] -> [1,1,1,128]
+        # [4096,128] -> [4096,1,1,128]
     else:
         cos = self.cos_embed
         sin = self.sin_embed
@@ -301,42 +305,15 @@ def rope_forward(
     query = query.view(*query.shape[:-1], -1, self.head_size).contiguous()
     key = key.view(*key.shape[:-1], -1, self.head_size).contiguous()
 
-    cos = cos.unsqueeze(-2).unsqueeze(-2)
+    cos = cos.unsqueeze(-2).unsqueeze(-2)   # 增在倒数第二个位置插入两个维度
     sin = sin.unsqueeze(-2).unsqueeze(-2)
 
     # makesure query's shape [4096, 1, 14, 128]
-    query = query.unsqueeze(1)
-    key = key.unsqueeze(1)
+    query = query.unsqueeze(1)  # 在第二个位置插入维度
+    key = key.unsqueeze(1)      # 在第二个位置插入维度
 
     q_embed, k_embed = torch_npu.npu_apply_rotary_pos_emb(query, key, cos, sin)
     return q_embed.flatten(-2), k_embed.flatten(-2)
-
-
-def qwen_rope_init_func(
-    self,
-    head_size: int,
-    rotary_dim: int,
-    max_position_embeddings: int,
-    base: float,
-    is_neox_style: bool,
-    dtype: torch.dtype,
-) -> None:
-    super(RotaryEmbedding, self).__init__()
-    self.head_size = head_size
-    self.rotary_dim = rotary_dim
-    self.max_position_embeddings = max_position_embeddings
-    self.base = base
-    self.is_neox_style = is_neox_style
-    self.dtype = dtype
-
-    cache = self._compute_cos_sin_cache()
-    cache = cache.to(dtype)
-    if get_ascend_config().torchair_graph_config.enabled:
-        __set_cos_sin_cache(self, seq_len=max_position_embeddings, device="npu", dtype=dtype)
-    else:
-        self.cos_sin_cache: torch.Tensor
-        self.register_buffer("cos_sin_cache", cache, persistent=False)
-
 
 def deepseek_rope_init_func(
     self,
