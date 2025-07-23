@@ -81,6 +81,7 @@ import vllm.envs as envs_vllm
 
 import vllm_ascend.envs as envs_ascend
 
+VLLM_USE_ACL_GRAPH = os.environ.get("VLLM_USE_ACL_GRAPH", 0)
 
 @dataclass
 class GraphCaptureContext:
@@ -334,7 +335,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self.torchair_compiled_model = None  # type: ignore
         self.torchair_compiled_models = {}  # type: ignore
         ascend_config = get_ascend_config()
-        self.torchair_graph_enabled = ascend_config.torchair_graph_config.enabled and self.vllm_config.model_config.use_mla
+        self.torchair_graph_enabled = ascend_config.torchair_graph_config.enabled # and self.vllm_config.model_config.use_mla
         self.use_cached_npu_graph = ascend_config.torchair_graph_config.use_cached_graph
         self.torchair_graph_batch_sizes = ascend_config.torchair_graph_config.graph_batch_sizes
 
@@ -771,6 +772,27 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     model_kwargs["kv_caches"] = self.kv_caches
                     model_kwargs["attn_metadata"] = attn_metadata
                 if self.torchair_graph_enabled and not with_prefill:
+                    # print(f'=====panchao _process_reqs============= kv_caches = {self.kv_caches}')
+                    # print(f'=====panchao _process_reqs============= attn_metadata = {attn_metadata}')
+                    # print(f'=====panchao _process_reqs============= input_ids = {input_ids.shape}')
+
+                    torch._dynamo.mark_static(input_ids)
+                    torch._dynamo.mark_static(positions)
+                    if not self.vllm_config.model_config.use_mla:
+                        torch._dynamo.mark_static(attn_metadata.block_tables)
+                    else:
+                        torch._dynamo.mark_static(attn_metadata.decode.block_table)
+                        torch._dynamo.mark_static(attn_metadata.decode.input_positions)
+                    torch._dynamo.mark_static(attn_metadata.slot_mapping)
+                    for kv in self.kv_caches:
+                        # assert isinstance(kv, tuple), "kv_cache must be a tuple"
+                        if isinstance(kv, torch.Tensor):
+                            # torch._dynamo.mark_static(kv[0])
+                            # torch._dynamo.mark_static(kv[1])
+                            torch._dynamo.mark_static(kv)
+                        if isinstance(kv, tuple):
+                            torch._dynamo.mark_static(kv[0])
+                            torch._dynamo.mark_static(kv[1])
                     compiled_model = self._get_torchair_lazy_compiled_model(
                         padded_batch_size)
                     hidden_states = compiled_model(
@@ -1238,23 +1260,32 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             with set_forward_context(None,
                                      self.vllm_config,
                                      num_tokens=num_tokens):
-                if self.torchair_graph_enabled and not with_prefill:
+                if self.torchair_graph_enabled and not with_prefill and VLLM_USE_ACL_GRAPH != '1':
                     attn_metadata = self.attn_metadata_builder.build_dummy(
                         num_reqs=num_tokens, num_actual_tokens=1)
                     # Only mark static while compiling
                     if is_compile:
                         torch._dynamo.mark_static(input_ids)
                         torch._dynamo.mark_static(positions)
-                        torch._dynamo.mark_static(
-                            attn_metadata.decode.block_table)
-                        torch._dynamo.mark_static(
-                            attn_metadata.decode.input_positions)
+                        if not self.vllm_config.model_config.use_mla:
+                            torch._dynamo.mark_static(attn_metadata.block_tables)
+                        else:
+                            torch._dynamo.mark_static(attn_metadata.decode.block_table)
+                            torch._dynamo.mark_static(attn_metadata.decode.input_positions)
                         torch._dynamo.mark_static(attn_metadata.slot_mapping)
                         for kv in self.kv_caches:
-                            assert isinstance(
-                                kv, tuple), "kv_cache must be a tuple"
-                            torch._dynamo.mark_static(kv[0])
-                            torch._dynamo.mark_static(kv[1])
+                            # print("====panchao=============== kv : ", kv.shape)
+                            # print("====panchao=============== key : ", kv[0].shape)
+                            # print("====panchao=============== value : ", kv[1].shape)
+                            # assert isinstance(kv, tuple), "kv_cache must be a tuple"
+                            if isinstance(kv, torch.Tensor):
+                                torch._dynamo.mark_static(kv)
+                            if isinstance(kv, tuple):
+                                torch._dynamo.mark_static(kv[0])
+                                torch._dynamo.mark_static(kv[1])
+                    # print(f'=====panchao============= kv_caches = {self.kv_caches}')
+                    # print(f'=====panchao============= attn_metadata = {attn_metadata}')
+                    # print(f'=====panchao============= input_ids = {input_ids.shape}')
                     compiled_model = self._get_torchair_lazy_compiled_model(
                         num_tokens)
                     hidden_states = compiled_model(
@@ -1342,12 +1373,20 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         import torchair  # type: ignore
         from torchair import patch_for_hcom  # type: ignore
 
+        # import logging
+        # torch._logging.set_logs(dynamo=logging.DEBUG, aot=logging.DEBUG, output_code=True, graph_code=True, recompiles=True)
+        # torchair.logger.setLevel(logging.DEBUG)
+
         patch_for_hcom()
         config = torchair.CompilerConfig()
+        if VLLM_USE_ACL_GRAPH == '1':
+            config.mode = "reduce-overhead"
+            config.debug.aclgraph.disable_reinplace_inplaceable_ops_pass=True
         config.experimental_config.frozen_parameter = True
         config.experimental_config.tiling_schedule_optimize = True
         config.experimental_config.enable_view_optimize = \
         get_ascend_config().torchair_graph_config.enable_view_optimize
+        # config.debug.graph_dump.type = "py"
         torch.npu.set_compile_mode(jit_compile=False)
         if not self.use_cached_npu_graph:
             npu_backend = torchair.get_npu_backend(compiler_config=config)
@@ -1432,23 +1471,31 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
                     dtype = kv_cache_spec.dtype
                     if self.torchair_graph_enabled:
-                        layer_kv_cache_nope = torch.zeros(
-                            kv_cache_shape[:-1] +
-                            (self.model_config.hf_text_config.kv_lora_rank, ),
-                            dtype=self.dtype,
-                            pin_memory=True,
-                            device=self.device)
-                        layer_kv_cache_pe = torch.zeros(
-                            kv_cache_shape[:-1] +
-                            (self.model_config.hf_text_config.qk_rope_head_dim,
-                             ),
-                            dtype=self.dtype,
-                            pin_memory=True,
-                            device=self.device)
-                        kv_caches[layer_name] = (layer_kv_cache_nope,
-                                                 layer_kv_cache_pe)
-                        torch_npu.npu_format_cast(kv_caches[layer_name][0], 2)
-                        torch_npu.npu_format_cast(kv_caches[layer_name][1], 2)
+                        if self.vllm_config.model_config.use_mla:
+                            layer_kv_cache_nope = torch.zeros(
+                                kv_cache_shape[:-1] +
+                                (self.model_config.hf_text_config.kv_lora_rank, ),
+                                dtype=self.dtype,
+                                pin_memory=True,
+                                device=self.device)
+                            layer_kv_cache_pe = torch.zeros(
+                                kv_cache_shape[:-1] +
+                                (self.model_config.hf_text_config.qk_rope_head_dim,
+                                ),
+                                dtype=self.dtype,
+                                pin_memory=True,
+                                device=self.device)
+                            kv_caches[layer_name] = (layer_kv_cache_nope,
+                                                    layer_kv_cache_pe)
+                            torch_npu.npu_format_cast(kv_caches[layer_name][0], 2)
+                            torch_npu.npu_format_cast(kv_caches[layer_name][1], 2)
+                        else:
+                            layer_kv_cache = torch.zeros(kv_cache_shape,
+                                                         dtype=self.dtype,
+                                                         pin_memory=True,
+                                                         device=self.device)
+                            kv_caches[layer_name] = layer_kv_cache.view(kv_cache_shape)
+                            torch_npu.npu_format_cast(kv_caches[layer_name], 2)
                     else:
                         kv_caches[layer_name] = torch.zeros(kv_cache_shape,
                                                             dtype=dtype,
