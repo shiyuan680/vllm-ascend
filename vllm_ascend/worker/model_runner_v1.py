@@ -1260,7 +1260,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             with set_forward_context(None,
                                      self.vllm_config,
                                      num_tokens=num_tokens):
-                if self.torchair_graph_enabled and not with_prefill and VLLM_USE_ACL_GRAPH != '1':
+                if not self.torchair_graph_enabled and not with_prefill and VLLM_USE_ACL_GRAPH != '1':
                     attn_metadata = self.attn_metadata_builder.build_dummy(
                         num_reqs=num_tokens, num_actual_tokens=1)
                     # Only mark static while compiling
