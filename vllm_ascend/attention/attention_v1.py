@@ -66,7 +66,7 @@ class AscendAttentionBackend(AttentionBackend):
         num_kv_heads: int,
         head_size: int,
     ) -> Tuple[int, ...]:
-        return (2, num_blocks, block_size, num_kv_heads, head_size)
+        return (num_blocks, block_size, num_kv_heads, head_size)
 
     @staticmethod
     def swap_blocks(
@@ -358,7 +358,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        kv_cache: torch.Tensor,
+        kv_cache: Tuple[torch.Tensor],
         attn_metadata: AscendMetadata,
         output: Optional[torch.Tensor] = None,
         trace_flag: bool = True,
@@ -368,7 +368,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             query: shape = [batch_size, seq_len, num_heads * head_size]
             key: shape = [batch_size, seq_len, num_kv_heads * head_size]
             value: shape = [batch_size, seq_len, num_kv_heads * head_size]
-            kv_cache: shape = [2, num_blocks, block_size,
+            kv_cache: shape = [num_blocks, block_size,
                                num_kv_heads, head_size]
                       key_cache = [num_blocks, block_size,
                                    num_kv_heads, head_size]
@@ -412,14 +412,18 @@ class AscendAttentionBackendImpl(AttentionImpl):
             value = value.contiguous()
 
             if kv_cache is not None and len(kv_cache) > 0:
-                if self.key_cache is None:
+                if (self.key_cache is None and
+                    (not self.torchair_graph_enabled or
+                    attn_metadata.attn_state != AscendAttentionState.DecodeOnly)):
                     self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
                 slots = attn_metadata.slot_mapping
                 if not attn_metadata.with_prefill_across_dp and self.torchair_graph_enabled:
+                    key_cache = kv_cache[0]
+                    value_cache = kv_cache[1]
                     self.update_kv_cache(key=key,
                                          value=value,
-                                         key_cache=self.key_cache,
-                                         value_cache=self.value_cache,
+                                         key_cache=key_cache,
+                                         value_cache=value_cache,
                                          slot_indices=slots.to(torch.int64))
                 else:
                     torch_npu._npu_reshape_and_cache(key=key[:num_actual_tokens],
@@ -466,44 +470,28 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     # query change to BSND
                     query = query.view(-1, 1, self.num_heads * self.head_size)
 
-                    key_cache = self.key_cache.view(*self.key_cache.shape[:-2], -1)
-                    value_cache = self.value_cache.view(*self.value_cache.shape[:-2], -1)
+                    # change to [num_blocks, block_size, num_kv_heads * head_size]
+                    key_cache = kv_cache[0].view(*kv_cache[0].shape[:-2], -1)
+                    value_cache = kv_cache[1].view(*kv_cache[1].shape[:-2], -1)
 
-                    if VLLM_USE_ACL_GRAPH == '1':
-                        q = self._bsh_to_bnsd(query, self.num_heads)
-                        k = self._bsh_to_bnsd(key_cache, self.num_kv_heads)
-                        v = self._bsh_to_bnsd(value_cache, self.num_kv_heads)
-                        output, _ = torch_npu.npu_fused_infer_attention_score(
-                            query=q,
-                            key=k,
-                            value=v,
-                            query_rope=None, # todo
-                            key_rope=None, # todo
-                            num_heads=self.num_heads,
-                            num_key_value_heads=self.num_kv_heads,
-                            # input_layout='BSH',
-                            input_layout='BNSD',
-                            atten_mask=attn_metadata.attn_mask, # done
-                            sparse_mode=0, # todo
-                            scale=self.scale,
-                            antiquant_mode=0,
-                            antiquant_scale=None,
-                            block_table=attn_metadata.block_tables,
-                            block_size=kv_cache[0].shape[1],
-                            actual_seq_lengths_kv=attn_metadata.seq_lens_list, # done
-                        )
-                    else:
-                        output = torch_npu.npu_incre_flash_attention(
-                            query=query,
-                            key=key_cache,
-                            value=value_cache,
-                            num_heads=self.num_heads,
-                            num_key_value_heads=self.num_kv_heads,
-                            input_layout='BSH',
-                            scale_value=self.scale,
-                            actual_seq_lengths=attn_metadata.seq_lens_list,
-                            block_table=attn_metadata.block_tables,
-                            block_size=kv_cache[0].shape[1],)
+                    output, _ = torch_npu.npu_fused_infer_attention_score(
+                        query=query.contiguous(),
+                        key=key_cache,
+                        value=value_cache,
+                        query_rope=None,
+                        key_rope=None,
+                        num_heads=self.num_heads,
+                        num_key_value_heads=self.num_kv_heads,
+                        input_layout='BSH',
+                        atten_mask=attn_metadata.attn_mask,
+                        sparse_mode=0,
+                        scale=self.scale,
+                        antiquant_mode=0,
+                        antiquant_scale=None,
+                        block_table=attn_metadata.block_tables,
+                        block_size=kv_cache[0].shape[1],
+                        actual_seq_lengths_kv=attn_metadata.seq_lens_list,
+                    )
                 else:
                     torch_npu._npu_paged_attention(
                         query=query,

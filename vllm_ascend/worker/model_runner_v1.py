@@ -772,10 +772,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     model_kwargs["kv_caches"] = self.kv_caches
                     model_kwargs["attn_metadata"] = attn_metadata
                 if self.torchair_graph_enabled and not with_prefill:
-                    # print(f'=====panchao _process_reqs============= kv_caches = {self.kv_caches}')
-                    # print(f'=====panchao _process_reqs============= attn_metadata = {attn_metadata}')
-                    # print(f'=====panchao _process_reqs============= input_ids = {input_ids.shape}')
-
                     torch._dynamo.mark_static(input_ids)
                     torch._dynamo.mark_static(positions)
                     if not self.vllm_config.model_config.use_mla:
@@ -785,11 +781,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         torch._dynamo.mark_static(attn_metadata.decode.input_positions)
                     torch._dynamo.mark_static(attn_metadata.slot_mapping)
                     for kv in self.kv_caches:
-                        # assert isinstance(kv, tuple), "kv_cache must be a tuple"
-                        if isinstance(kv, torch.Tensor):
-                            # torch._dynamo.mark_static(kv[0])
-                            # torch._dynamo.mark_static(kv[1])
-                            torch._dynamo.mark_static(kv)
+                        assert isinstance(kv, tuple), "kv_cache must be a tuple"
                         if isinstance(kv, tuple):
                             torch._dynamo.mark_static(kv[0])
                             torch._dynamo.mark_static(kv[1])
@@ -1274,18 +1266,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                             torch._dynamo.mark_static(attn_metadata.decode.input_positions)
                         torch._dynamo.mark_static(attn_metadata.slot_mapping)
                         for kv in self.kv_caches:
-                            # print("====panchao=============== kv : ", kv.shape)
-                            # print("====panchao=============== key : ", kv[0].shape)
-                            # print("====panchao=============== value : ", kv[1].shape)
-                            # assert isinstance(kv, tuple), "kv_cache must be a tuple"
-                            if isinstance(kv, torch.Tensor):
-                                torch._dynamo.mark_static(kv)
+                            assert isinstance(kv, tuple), "kv_cache must be a tuple"
                             if isinstance(kv, tuple):
                                 torch._dynamo.mark_static(kv[0])
                                 torch._dynamo.mark_static(kv[1])
-                    # print(f'=====panchao============= kv_caches = {self.kv_caches}')
-                    # print(f'=====panchao============= attn_metadata = {attn_metadata}')
-                    # print(f'=====panchao============= input_ids = {input_ids.shape}')
                     compiled_model = self._get_torchair_lazy_compiled_model(
                         num_tokens)
                     hidden_states = compiled_model(
@@ -1490,12 +1474,18 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                             torch_npu.npu_format_cast(kv_caches[layer_name][0], 2)
                             torch_npu.npu_format_cast(kv_caches[layer_name][1], 2)
                         else:
-                            layer_kv_cache = torch.zeros(kv_cache_shape,
-                                                         dtype=self.dtype,
-                                                         pin_memory=True,
-                                                         device=self.device)
-                            kv_caches[layer_name] = layer_kv_cache.view(kv_cache_shape)
-                            torch_npu.npu_format_cast(kv_caches[layer_name], 2)
+                            layer_k_cache = torch.zeros(kv_cache_shape,
+                                                        dtype=self.dtype,
+                                                        pin_memory=True,
+                                                        device=self.device)
+                            layer_v_cache = torch.zeros(kv_cache_shape,
+                                                        dtype=self.dtype,
+                                                        pin_memory=True,
+                                                        device=self.device)
+                            kv_caches[layer_name] = (layer_k_cache,
+                                                    layer_v_cache)
+                            torch_npu.npu_format_cast(kv_caches[layer_name][0], 2)
+                            torch_npu.npu_format_cast(kv_caches[layer_name][1], 2)
                     else:
                         kv_caches[layer_name] = torch.zeros(kv_cache_shape,
                                                             dtype=dtype,

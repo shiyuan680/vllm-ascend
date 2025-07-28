@@ -62,27 +62,37 @@ def allocate_kv_cache(
             #     pin_memory=pin_memory,
             #     device=device)
 
-            layer_kv_cache = torch.zeros(alloc_shape,
-                                     dtype=self.dtype,
-                                     pin_memory=pin_memory,
-                                     device=device)
+            layer_k_cache = torch.zeros(alloc_shape,
+                                        dtype=self.dtype,
+                                        pin_memory=pin_memory,
+                                        device=device)
+
+            layer_v_cache = torch.zeros(alloc_shape,
+                                        dtype=self.dtype,
+                                        pin_memory=pin_memory,
+                                        device=device)
 
             # view back to (TOTAL_PAGES, PAGE_SIZE, entry_shape...) for cases
             # when entry_shape is higher than 1D
-            kv_cache.append(layer_kv_cache.view(kv_cache_shape))
+            kv_cache.append((layer_k_cache, layer_v_cache))
     else:
         for _ in range(self.num_attention_layers):
             # null block in CpuGpuBlockAllocator requires at least that
             # block to be zeroed-out.
             # We zero-out everything for simplicity.
-            layer_kv_cache = torch.zeros(kv_cache_shape,
-                                         dtype=self.dtype,
-                                         pin_memory=pin_memory,
-                                         device=device)
+            layer_k_cache = torch.zeros(alloc_shape,
+                                        dtype=self.dtype,
+                                        pin_memory=pin_memory,
+                                        device=device)
+
+            layer_v_cache = torch.zeros(alloc_shape,
+                                        dtype=self.dtype,
+                                        pin_memory=pin_memory,
+                                        device=device)
 
             # view back to (TOTAL_PAGES, PAGE_SIZE, entry_shape...) for cases
             # when entry_shape is higher than 1D
-            kv_cache.append(layer_kv_cache)
+            kv_cache.append((layer_k_cache, layer_v_cache))
     return kv_cache
 
 
