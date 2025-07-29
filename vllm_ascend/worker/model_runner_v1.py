@@ -1252,7 +1252,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             with set_forward_context(None,
                                      self.vllm_config,
                                      num_tokens=num_tokens):
-                if not self.torchair_graph_enabled and not with_prefill and VLLM_USE_ACL_GRAPH != '1':
+                if self.torchair_graph_enabled and not with_prefill and VLLM_USE_ACL_GRAPH != '1':
                     attn_metadata = self.attn_metadata_builder.build_dummy(
                         num_reqs=num_tokens, num_actual_tokens=1)
                     # Only mark static while compiling
@@ -1474,6 +1474,12 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                             torch_npu.npu_format_cast(kv_caches[layer_name][0], 2)
                             torch_npu.npu_format_cast(kv_caches[layer_name][1], 2)
                         else:
+                            # Round up a multiple of 64 to reduce repeated compilation caused by
+                            # num_blocks fluctuation caused by memory differences
+                            num_blocks = (num_blocks + 63) // 64 * 64
+                            kv_cache_shape = self.attn_backend.get_kv_cache_shape(
+                                num_blocks, kv_cache_spec.block_size,
+                                kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
                             layer_k_cache = torch.zeros(kv_cache_shape,
                                                         dtype=self.dtype,
                                                         pin_memory=True,

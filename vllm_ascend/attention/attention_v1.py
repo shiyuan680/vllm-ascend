@@ -412,9 +412,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
             value = value.contiguous()
 
             if kv_cache is not None and len(kv_cache) > 0:
-                if (self.key_cache is None and
-                    (not self.torchair_graph_enabled or
-                    attn_metadata.attn_state != AscendAttentionState.DecodeOnly)):
+                if ((not self.torchair_graph_enabled or
+                    attn_metadata.attn_state != AscendAttentionState.DecodeOnly) and
+                    self.key_cache is None):
                     self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
                 slots = attn_metadata.slot_mapping
                 if not attn_metadata.with_prefill_across_dp and self.torchair_graph_enabled:
