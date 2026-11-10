@@ -103,6 +103,57 @@ DEEPSEEK_V4_CASE = WeightUpdateModelCase(
 DEEPSEEK_CASES = (DEEPSEEK_V4_CASE,)
 
 
+# Engram host-offload coverage. The published V4.1 checkpoint ships two Engram
+# tables of 384M x 256 BF16 rows (`text_config.engram_num_embeddings`), i.e.
+# ~183 GiB each; reloading one must update the registered host range instead of
+# materializing the table on the device, which is the OOM this lane guards.
+#
+# `full_transfer_matrix=False` keeps the case on the unpacked NPU IPC path only:
+# `pytest_model_cases` selects a non-matrix case for `npu_ipc` with
+# `packed=False` and drops it from every other lane, so the packed buffer
+# lifecycle (#18763) cannot mask a reload regression here.
+DEEPSEEK_V41_ENGRAM_CASE = WeightUpdateModelCase(
+    id="deepseek-v4.1-flash-engram-cpu-offload",
+    model="deepseek-ai/DeepSeek-V4.1-Flash-1017",
+    hf_overrides={
+        # Layer-indexed lists have to be trimmed with the layer count, otherwise
+        # vLLM builds a config that points Engram / KV-source / DSpark at layers
+        # the reduced model does not have.
+        "num_hidden_layers": 4,
+        "compress_ratios": [0, 0, 2, 2],
+        "kv_source_layer_ids": [2],
+        "index_source_layer_ids": [2],
+        "candidate_source_layer_id": 2,
+        "engram_layer_ids": [1],
+        # Keep one Engram layer, and shrink its table from 384M rows to the
+        # smallest size that still exercises the host-offload lookup.
+        "engram_num_embeddings": [4096],
+        "num_nextn_predict_layers": 0,
+        "dspark_target_layer_ids": [],
+        "n_routed_experts": 8,
+    },
+    extra_server_args=(
+        "--tokenizer-mode",
+        "deepseek_v41",
+        # The case is about host-offloaded Engram storage: `cpu_offload` puts the
+        # table in registered host memory and the loader reads it through UVA.
+        "--engram-config",
+        json.dumps({"cpu_offload": True}),
+    ),
+    full_transfer_matrix=False,
+    skip_reason=(
+        "DeepSeek-V4.1 has no payload lane in the shared matrix yet: "
+        "FixedRandomWeightSource enumerates parameters from a Transformers meta "
+        "model, and transformers exposes no DeepseekV41ForCausalLM, so the "
+        "checkpoint names and the reduced-V4.1 config still have to be validated "
+        "on 2 NPUs"
+    ),
+)
+
+
+DEEPSEEK_V41_CASES = (DEEPSEEK_V41_ENGRAM_CASE,)
+
+
 GLM51_CASE = WeightUpdateModelCase(
     id="glm-5.1-sfa-derived-kv",
     model="zai-org/GLM-5.1",
@@ -128,7 +179,7 @@ PACKED_LANE_SKIP_REASON = (
 )
 
 
-MODEL_CASES = (*QWEN_CASES, *DEEPSEEK_CASES, *GLM_CASES)
+MODEL_CASES = (*QWEN_CASES, *DEEPSEEK_CASES, *DEEPSEEK_V41_CASES, *GLM_CASES)
 
 
 def pytest_model_cases(backend: str, *, model_cases: tuple[WeightUpdateModelCase, ...] = MODEL_CASES) -> list[Any]:

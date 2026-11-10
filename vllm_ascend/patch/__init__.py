@@ -1789,3 +1789,37 @@
 #       Remove this patch when upstream provides a backend capability hook for
 #       enabling MoE sequence parallelism with DP=1.
 #
+# ** 36. File: worker/patch_offload_reload.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.model_executor.model_loader.reload.meta.materialize_layer` and the
+#      `materialize_layer` it relays in `reload.layerwise` (the name the reload
+#      actually calls)
+#   2. `vllm.model_executor.model_loader.reload.layerwise._copy_and_restore_kernel_tensors`
+#    Why:
+#       The layerwise reload materializes meta tensors on the default device, so a
+#       parameter that lives in registered host memory is rebuilt as a device
+#       tensor for the duration of the update. For an Engram table that is a full
+#       per-rank allocation (22.89 GiB for a 384M x 256 BF16 table over 8 ranks)
+#       which does not fit next to the weights a level-2 sleep keeps resident:
+#       `finalize_layerwise_reload` dies with torch.OutOfMemoryError inside
+#       `materialize_meta_tensor -> torch.empty_strided`. Checkpoint reload and the
+#       RL update (HCCL / NPU IPC, including the unpacked IPC path) all finish
+#       through that same function, so no transfer backend avoids it.
+#    How:
+#       A host-offloaded parameter carries the host range it aliases as a tensor
+#       attribute, which survives the reload's meta round trip (see
+#       `AscendParallelEngramEmbedding`). The patched `materialize_layer` rebuilds
+#       such a parameter on that range instead of allocating a device copy, and the
+#       patched `_copy_and_restore_kernel_tensors` leaves the captured host storage
+#       in place instead of copying it back out of the device tensor, so the update
+#       lands in the memory the UVA lookup kernel reads. Upstream `reload/__init__.py`
+#       documents this gap as "Composition with CPU offloading has not been
+#       implemented". Both hooks are optional internals: a vLLM build without the
+#       reload package, or without these functions, keeps the upstream behaviour
+#       instead of failing worker startup.
+#    Related PR (if no, explain why):
+#       No, Ascend-specific host/UVA Engram offload has no upstream equivalent yet.
+#    Future Plan:
+#       Remove this patch when upstream reload is CPU-offload aware, e.g. when
+#       `materialize_meta_tensor` honours an offloaded parameter's host storage.
+#
